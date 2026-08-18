@@ -65,8 +65,13 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 
 	// TODO: these aren't great indications of support, really.
 	if _, ok := fs.(billy.Symlink); ok {
-		res.Properties |= FSInfoPropertyLink
 		res.Properties |= FSInfoPropertySymlink
+	}
+	// A client only issues LINK if this bit is set, so it must reflect
+	// what onLink can actually do -- otherwise every hard link a client
+	// attempts becomes an error it was never warned about.
+	if hardLinker(fs, userHandle.Change(fs)) != nil {
+		res.Properties |= FSInfoPropertyLink
 	}
 	// TODO: if the nfs share spans multiple virtual mounts, may need
 	// to support granular PATHINFO responses.

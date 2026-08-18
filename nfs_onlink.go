@@ -4,66 +4,126 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"reflect"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// Backing billy.FS doesn't support hard links
+// linkErrorBody is LINK3resfail: a post_op_attr for the file followed by
+// wcc_data for the link directory, both "not present". It is four bytes
+// longer than the bare wcc_data body the other directory operations use,
+// and a client handed the short form cannot decode the reply at all --
+// it reports EIO instead of the status the server chose.
+var linkErrorBody = [12]byte{}
+
+// HardLinker is implemented by a billy.Filesystem that can create hard
+// links. LINK names its source by file handle, which this package resolves
+// to a path, so the method takes two paths -- the same shape as os.Link.
+//
+// UnixChange carries the same operation for backends that expose it
+// through Handler.Change; either one is enough.
+type HardLinker interface {
+	Link(oldname, newname string) error
+}
+
+// hardLinker returns the hard-link implementation to use for fs, or nil if
+// the backend cannot make hard links.
+func hardLinker(fs billy.Filesystem, changer billy.Change) func(oldname, newname string) error {
+	if l, ok := fs.(HardLinker); ok {
+		return l.Link
+	}
+	if c, ok := changer.(UnixChange); ok {
+		return c.Link
+	}
+	return nil
+}
+
 func onLink(ctx context.Context, w *response, userHandle Handler) error {
-	w.errorFmt = wccDataErrorFormatter
-	obj := DirOpArg{}
-	err := xdr.Read(w.req.Body, &obj)
+	w.errorFmt = errFormatterWithBody(linkErrorBody[:])
+
+	// LINK3args (RFC 1813, 3.3.15) is `nfs_fh3 file` followed by
+	// `diropargs3 link`. There is no sattr3 in this message.
+	fileHandle, err := xdr.ReadOpaque(w.req.Body)
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	attrs, err := ReadSetFileAttributes(w.req.Body)
-	if err != nil {
+	link := DirOpArg{}
+	if err := xdr.Read(w.req.Body, &link); err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	target, err := xdr.ReadOpaque(w.req.Body)
-	if err != nil {
-		return &NFSStatusError{NFSStatusInval, err}
-	}
-
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, source, err := userHandle.FromHandle(fileHandle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
+	}
+	linkFS, dirPath, err := userHandle.FromHandle(link.Handle)
+	if err != nil {
+		return &NFSStatusError{NFSStatusStale, err}
+	}
+	// A hard link cannot span filesystems.
+	if !reflect.DeepEqual(fs, linkFS) {
+		return &NFSStatusError{NFSStatusXDev, os.ErrInvalid}
 	}
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
-
-	if len(string(obj.Filename)) > PathNameMax {
+	if len(string(link.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}
 
-	newFilePath := fs.Join(append(path, string(obj.Filename))...)
-	if _, err := fs.Stat(newFilePath); err == nil {
-		return &NFSStatusError{NFSStatusExist, os.ErrExist}
+	linker := hardLinker(fs, userHandle.Change(fs))
+	if linker == nil {
+		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
 	}
-	if s, err := fs.Stat(fs.Join(path...)); err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	} else if !s.IsDir() {
+
+	sourcePath := fs.Join(source...)
+	sourceInfo, err := fs.Lstat(sourcePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		if os.IsPermission(err) {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		return &NFSStatusError{NFSStatusIO, err}
+	}
+	if sourceInfo.IsDir() {
+		return &NFSStatusError{NFSStatusIsDir, nil}
+	}
+
+	dirFullPath := fs.Join(dirPath...)
+	dirInfo, err := fs.Stat(dirFullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		if os.IsPermission(err) {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		return &NFSStatusError{NFSStatusIO, err}
+	}
+	if !dirInfo.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
+	preCacheData := ToFileAttribute(dirInfo, dirFullPath).AsCache()
 
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
-	changer := userHandle.Change(fs)
-	if changer == nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	cos, ok := changer.(UnixChange)
-	if !ok {
-		return &NFSStatusError{NFSStatusAccess, err}
+	newFile := append(dirPath, string(link.Filename))
+	newFilePath := fs.Join(newFile...)
+	if _, err := fs.Lstat(newFilePath); err == nil {
+		return &NFSStatusError{NFSStatusExist, os.ErrExist}
 	}
 
-	err = cos.Link(string(target), newFilePath)
-	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
+	if err := linker(sourcePath, newFilePath); err != nil {
+		if os.IsNotExist(err) {
+			return &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		if os.IsExist(err) {
+			return &NFSStatusError{NFSStatusExist, err}
+		}
+		if os.IsPermission(err) {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
@@ -71,19 +131,13 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-
-	// "handle follows"
-	if err := xdr.Write(writer, uint32(1)); err != nil {
+	// LINK3resok is the file's post_op_attr and the directory's wcc_data.
+	// It carries no file handle: the client already holds one for the
+	// object it asked to link.
+	if err := WritePostOpAttrs(writer, tryStat(fs, source)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fp); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, append(path, string(obj.Filename)))); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-
-	if err := WriteWcc(writer, nil, tryStat(fs, path)); err != nil {
+	if err := WriteWcc(writer, preCacheData, tryStat(fs, dirPath)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
