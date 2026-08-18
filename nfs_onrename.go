@@ -87,6 +87,11 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
+	// Both names changed identity: the source is free again and the
+	// destination now holds something no exclusive create put there.
+	exclusiveCreates.forget(verifierKey(fs, fromLoc))
+	exclusiveCreates.forget(verifierKey(fs, toLoc))
+
 	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

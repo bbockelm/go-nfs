@@ -92,6 +92,10 @@ func onRemoveObj(ctx context.Context, w *response, userHandle Handler, directory
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
+	// The name is free again, so the verifier of whatever exclusive create
+	// last held it must not be honored for the next one.
+	exclusiveCreates.forget(verifierKey(fs, toDelete))
+
 	if err := userHandle.InvalidateHandle(fs, toDeleteHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

@@ -59,8 +59,8 @@ func (h *hardlinkFS) Link(oldname, newname string) error {
 	return dst.Close()
 }
 
-// linkTarget brings up a server over fs and mounts it.
-func linkTarget(t *testing.T, fs billy.Filesystem) *nfsc.Target {
+// serveTarget brings up a server over fs and mounts it.
+func serveTarget(t *testing.T, fs billy.Filesystem) *nfsc.Target {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "localhost:0")
@@ -122,7 +122,7 @@ func TestLink(t *testing.T) {
 	}
 	f.Close()
 
-	target := linkTarget(t, mem)
+	target := serveTarget(t, mem)
 	dirHandle, err := target.Mkdir("/d", 0755)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestLinkFailureIsDecodable(t *testing.T) {
 		f.Close()
 	}
 
-	target := linkTarget(t, mem)
+	target := serveTarget(t, mem)
 	_, rootHandle, err := target.Lookup("/")
 	if err != nil {
 		t.Fatal(err)

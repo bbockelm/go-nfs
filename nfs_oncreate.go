@@ -27,6 +27,7 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 	var attrs *SetFileAttributes
+	var exclusiveVerf [8]byte
 	if how == createModeUnchecked || how == createModeGuarded {
 		sattr, err := ReadSetFileAttributes(w.req.Body)
 		if err != nil {
@@ -35,13 +36,13 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		attrs = sattr
 	} else if how == createModeExclusive {
 		// read createverf3
-		var verf [8]byte
-		if err := xdr.Read(w.req.Body, &verf); err != nil {
+		if err := xdr.Read(w.req.Body, &exclusiveVerf); err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
-		Log.Errorf("failing create to indicate lack of support for 'exclusive' mode.")
-		// TODO: support 'exclusive' mode.
-		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+		// EXCLUSIVE carries a verifier where the other modes carry
+		// attributes; Apply dereferences its receiver's fields, so it gets
+		// an empty set rather than nil. The client follows with SETATTR.
+		attrs = &SetFileAttributes{}
 	} else {
 		// invalid
 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
@@ -61,12 +62,24 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 
 	newFile := append(path, string(obj.Filename))
 	newFilePath := fs.Join(newFile...)
+	// retransmit is set when an EXCLUSIVE create repeats a verifier already
+	// honored for this name; the file must then be left exactly as it is.
+	retransmit := false
 	if s, err := fs.Stat(newFilePath); err == nil {
 		if s.IsDir() {
 			return &NFSStatusError{NFSStatusExist, nil}
 		}
 		if how == createModeGuarded {
 			return &NFSStatusError{NFSStatusExist, os.ErrPermission}
+		}
+		if how == createModeExclusive {
+			// RFC 1813: repeating the verifier of a create that already
+			// succeeded is a retransmission and succeeds idempotently. Any
+			// other verifier means the name is genuinely taken.
+			if !exclusiveCreates.matches(verifierKey(fs, newFilePath), exclusiveVerf) {
+				return &NFSStatusError{NFSStatusExist, os.ErrExist}
+			}
+			retransmit = true
 		}
 	} else {
 		if s, err := fs.Stat(fs.Join(path...)); err != nil {
@@ -76,14 +89,21 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 
-	file, err := fs.Create(newFilePath)
-	if err != nil {
-		Log.Errorf("Error Creating: %v", err)
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if err := file.Close(); err != nil {
-		Log.Errorf("Error Creating: %v", err)
-		return &NFSStatusError{NFSStatusAccess, err}
+	// fs.Create truncates, so it must not run for a retransmission: the
+	// original request's data would be discarded.
+	if !retransmit {
+		file, err := fs.Create(newFilePath)
+		if err != nil {
+			Log.Errorf("Error Creating: %v", err)
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if err := file.Close(); err != nil {
+			Log.Errorf("Error Creating: %v", err)
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if how == createModeExclusive {
+			exclusiveCreates.remember(verifierKey(fs, newFilePath), exclusiveVerf)
+		}
 	}
 
 	fp := userHandle.ToHandle(fs, newFile)
@@ -105,7 +125,7 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, fp); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, []string{file.Name()})); err != nil {
+	if err := WritePostOpAttrs(writer, tryStat(fs, newFile)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
