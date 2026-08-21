@@ -21,7 +21,9 @@ func onReadLink(ctx context.Context, w *response, userHandle Handler) error {
 
 	out, err := fs.Readlink(fs.Join(path...))
 	if err != nil {
-		if info, err := fs.Stat(fs.Join(path...)); err == nil {
+		// Lstat: the question here is whether THIS object is a symlink,
+		// which Stat can only answer about the object at the far end of one.
+		if info, err := fs.Lstat(fs.Join(path...)); err == nil {
 			if info.Mode()&os.ModeSymlink == 0 {
 				return &NFSStatusError{NFSStatusInval, err}
 			}

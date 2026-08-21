@@ -32,8 +32,14 @@ func onRemoveObj(ctx context.Context, w *response, userHandle Handler, directory
 		return &NFSStatusError{NFSStatusNameTooLong, nil}
 	}
 
+	// Lstat, not Stat: a file handle names an object, never whatever a
+	// symlink at that name points at. RFC 1813 makes both operands of
+	// REMOVE and RMDIR names in a directory — "the file to be removed",
+	// not "the file the name resolves to" — and NFSv3 clients resolve
+	// symlinks themselves, one LOOKUP at a time, so a server that follows
+	// one has resolved a link the client never asked it to.
 	fullPath := fs.Join(path...)
-	dirInfo, err := fs.Stat(fullPath)
+	dirInfo, err := fs.Lstat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
@@ -48,8 +54,16 @@ func onRemoveObj(ctx context.Context, w *response, userHandle Handler, directory
 	}
 	preCacheData := ToFileAttribute(dirInfo, fullPath).AsCache()
 
+	// The object being removed, likewise by Lstat. Following here was
+	// wrong three ways: a DANGLING symlink answered NFS3ERR_NOENT and was
+	// never removed at all (so `rm -rf` of a tree whose link targets sort
+	// first left every link behind, and the rmdir after it failed with
+	// NFS3ERR_NOTEMPTY, reproducibly, however many times it was retried);
+	// a symlink to a directory answered NFS3ERR_ISDIR to REMOVE; and a
+	// symlink to a file was removed only because the backend's own Remove
+	// does not follow, which is luck rather than agreement.
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
-	toRemoveStat, err := fs.Stat(toDelete)
+	toRemoveStat, err := fs.Lstat(toDelete)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
